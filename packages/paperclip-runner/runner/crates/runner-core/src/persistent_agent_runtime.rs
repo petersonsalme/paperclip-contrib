@@ -295,6 +295,14 @@ pub(crate) fn resolve(
         }
     }
     provider.insert("instructions".into(), json!(instructions));
+    let state_dir = if config.state_dir.is_absolute() {
+        config.state_dir.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| invalid())?
+            .join(&config.state_dir)
+    };
+    let state_dir = state_dir.canonicalize().unwrap_or(state_dir);
     match provider.get("kind").and_then(Value::as_str) {
         Some("codex") => {
             provider.insert("command".into(), json!("codex"));
@@ -304,10 +312,6 @@ pub(crate) fn resolve(
                 "-c".to_owned(),
                 format!("shell_environment_policy.set.AGENT_HOME={}", json!(home)),
             ];
-            let state_dir = std::env::current_dir()
-                .map_err(|_| invalid())?
-                .join(&config.state_dir);
-            let state_dir = state_dir.canonicalize().unwrap_or(state_dir);
             for (name, access, network) in [
                 (
                     "paperclip-runner-workspace-only",
@@ -345,19 +349,13 @@ pub(crate) fn resolve(
                 .ok_or_else(invalid)?;
             provider.insert("command".into(), json!(profile.command.path));
             provider.insert("args".into(), json!([profile.proxy_script.path]));
-            provider.insert(
-                "runtimeDirectory".into(),
-                json!(config.state_dir.join("opencode")),
-            );
+            provider.insert("runtimeDirectory".into(), json!(state_dir.join("opencode")));
         }
         Some("acpx") => {
             let profile = config.acpx_launch_profile.as_ref().ok_or_else(invalid)?;
             provider.insert("sidecarCommand".into(), json!(profile.command));
             provider.insert("sidecarArgs".into(), json!(profile.args));
-            provider.insert(
-                "runtimeDirectory".into(),
-                json!(config.state_dir.join("acpx")),
-            );
+            provider.insert("runtimeDirectory".into(), json!(state_dir.join("acpx")));
         }
         _ => return Err(invalid()),
     }
@@ -403,6 +401,56 @@ mod tests {
             precondition: None,
             payload,
         }
+    }
+
+    #[test]
+    fn installed_provider_directories_resolve_a_relative_runner_state_path() {
+        let root =
+            std::env::temp_dir().join(format!("installed-provider-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let artifact = |name| crate::durable::QualifiedLaunchArtifact {
+            path: root.join(name),
+            sha256: "a".repeat(64),
+        };
+        let mut runtime = config(&root);
+        runtime.state_dir = PathBuf::from(format!("relative-{}", uuid::Uuid::new_v4()));
+        runtime.opencode_launch_profile = Some(crate::durable::OpenCodeLaunchProfile {
+            command: artifact("node"),
+            proxy_script: artifact("proxy.cjs"),
+            executable: artifact("opencode"),
+        });
+        runtime.acpx_launch_profile = Some(crate::durable::AcpxLaunchProfile {
+            authority_digest: format!("sha256:{}", "a".repeat(64)),
+            command: root.join("node"),
+            args: vec![root.join("sidecar.cjs").to_string_lossy().into_owned()],
+            artifacts: vec![artifact("node")],
+        });
+        for kind in ["opencode", "acpx"] {
+            let resolved = resolve(
+                &command(json!({"provider": {"kind": kind, "runtimeOwnership": "agent_home"}})),
+                &runtime,
+                &home,
+                &workspace,
+            )
+            .unwrap();
+            let path = Path::new(
+                resolved.payload["provider"]["runtimeDirectory"]
+                    .as_str()
+                    .unwrap(),
+            );
+            assert!(path.is_absolute(), "{kind}: {}", path.display());
+            assert_eq!(
+                path,
+                std::env::current_dir()
+                    .unwrap()
+                    .join(&runtime.state_dir)
+                    .join(kind)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

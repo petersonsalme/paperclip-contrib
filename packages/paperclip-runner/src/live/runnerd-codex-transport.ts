@@ -3573,6 +3573,32 @@ export function parseAcpxTurnControlCapabilities(
   return { steering: controls.steering, queuedFollowUp: controls.queuedFollowUp };
 }
 
+function resolvePersistentRuntime(
+  runAttachTemplate: Record<string, unknown>,
+  options: Pick<CapabilityRunnerdCodexTransportOptions, "persistentAgentHome" | "provider" | "opencodePermissionMode">,
+  currentRunGrant?: NativeRunRuntimeGrant,
+): void {
+  if (options.persistentAgentHome) {
+    const descriptor = runAttachTemplate.provider as Record<string, unknown>;
+    // The attachment seed already has the latest grant when no new grant is supplied.
+    const sourceRuntimeContext = currentRunGrant ? currentRunGrant.runtimeContext
+      : descriptor.runtimeContext as NativeRuntimeContextSnapshot | null;
+    for (const key of ["command", "args", "sidecarCommand", "sidecarArgs", "runtimeDirectory", "cwd", "runtimeContext"]) delete descriptor[key];
+    descriptor.runtimeOwnership = "agent_home";
+    if (options.provider === "opencode") descriptor.opencodePermissionMode = options.opencodePermissionMode ?? "allow";
+    descriptor.runtimeContext = sourceRuntimeContext ? {
+      ...sourceRuntimeContext,
+      mcp: { ...sourceRuntimeContext.mcp, bindingId: null },
+      instructions: { entryPath: sourceRuntimeContext.instructions.entryPath,
+        bundle: { ...sourceRuntimeContext.instructions.bundle, rootPath: "." } },
+      skills: sourceRuntimeContext.skills.map(skill => ({ ...skill, bundle: { ...skill.bundle, rootPath: `skills/${skill.runtimeName}` } })),
+    } : null;
+    descriptor.instructions = sourceRuntimeContext
+      ? sourceRuntimeContext.prompt.text + "\n\n" + (sourceRuntimeContext.connectionInstructions?.text ?? "")
+      : currentRunGrant?.instructions ?? descriptor.instructions;
+  }
+}
+
 class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #root: string;
   readonly #ownsRoot: boolean;
@@ -4140,25 +4166,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
   }
 
-  #resolvePersistentRuntime(runAttachTemplate: Record<string, unknown>): void {
-    if (this.options.persistentAgentHome) {
-      const sourceRuntimeContext = this.options.runtimeContext ?? null;
-      const descriptor = runAttachTemplate.provider as Record<string, unknown>;
-      for (const key of ["command", "args", "sidecarCommand", "sidecarArgs", "runtimeDirectory", "cwd", "runtimeContext"]) delete descriptor[key];
-      descriptor.runtimeOwnership = "agent_home";
-      if (this.options.provider === "opencode") descriptor.opencodePermissionMode = this.options.opencodePermissionMode ?? "allow";
-      descriptor.runtimeContext = sourceRuntimeContext ? {
-        ...sourceRuntimeContext,
-        mcp: { ...sourceRuntimeContext.mcp, bindingId: null },
-        instructions: { entryPath: sourceRuntimeContext.instructions.entryPath,
-          bundle: { ...sourceRuntimeContext.instructions.bundle, rootPath: "." } },
-        skills: sourceRuntimeContext.skills.map(skill => ({ ...skill, bundle: { ...skill.bundle, rootPath: `skills/${skill.runtimeName}` } })),
-      } : null;
-      descriptor.instructions = sourceRuntimeContext
-        ? sourceRuntimeContext.prompt.text + "\n\n" + (sourceRuntimeContext.connectionInstructions?.text ?? "")
-        : this.options.baseInstructions ?? descriptor.instructions;
-    }
-  }
 
   async attachRun(input: {
     runId: string;
@@ -4220,7 +4227,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             currentRunGrant?.runtimeContext,
             currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
           );
-      this.#resolvePersistentRuntime(runAttachTemplate);
+      resolvePersistentRuntime(runAttachTemplate, this.options, currentRunGrant);
       this.#runAttachTemplate = structuredClone(runAttachTemplate);
       const payload = {
         ...runAttachTemplate,
@@ -5207,7 +5214,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // Preserve the first generation's provider attachment seed independently
     // of bounded command history. The in-memory copy serves a live warm
     // continuation; the control-plane copy serves a controller/runner resume.
-    this.#resolvePersistentRuntime(runAttachTemplate);
+    resolvePersistentRuntime(runAttachTemplate, this.options);
     this.#runAttachTemplate = structuredClone(runAttachTemplate);
     core.persistRunAttachTemplate(runAttachTemplate);
     core.queueCommand("run.prepare", runAttachTemplate);
@@ -7559,6 +7566,7 @@ export const runnerdLaunchProfileInternals = Object.freeze({
 });
 
 export const runnerdRecoveryInternals = Object.freeze({
+  resolvePersistentRuntime,
   projectCopilotRunGrant,
   completedMaintenanceTerminalReceipt,
   completedMaintenanceTerminalReplayMatches,

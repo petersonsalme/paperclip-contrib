@@ -699,6 +699,33 @@ it("projects a warm Copilot grant onto the remote runner filesystem", () => {
   expect(runnerdRecoveryInternals.projectCopilotRunGrant(grant)).toEqual(grant);
 });
 
+it.each([true, false])("uses the current installed-home run grant instead of the opening context (%s)", withContext => {
+  const prior = assignedRuntimeContext("/controller/old-skills", "/controller/old-instructions");
+  const current = structuredClone(prior);
+  current.prompt.text = "Current run policy.";
+  current.prompt.digest = createHash("sha256").update(current.prompt.text).digest("hex");
+  current.connectionInstructions = { text: "Current connection instructions.", digest: createHash("sha256").update("Current connection instructions.").digest("hex") };
+  current.aggregateDigest = canonicalNativeRuntimeContextDigest(current);
+  const grant = { instructions: "Current instructions without a context.", runtimeContext: withContext ? current : null };
+  const options = { persistentAgentHome: true, provider: "acpx" as const, runtimeContext: prior };
+  const template = runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: {
+    provider: { kind: "acpx", agent: "claude", runId: "old-run", instructions: "Old instructions", runtimeContext: prior },
+  } }, { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "new-run", normalizedSessionId: "session", turnId: "turn", itemId: "item" },
+    null, undefined, grant.runtimeContext, { text: grant.instructions, context: grant.runtimeContext });
+  runnerdRecoveryInternals.resolvePersistentRuntime(template, options, grant);
+  expect(template.provider).toMatchObject({ runtimeOwnership: "agent_home", instructions: withContext
+    ? "Current run policy.\n\nCurrent connection instructions." : grant.instructions });
+  if (withContext) {
+    expect(template.provider).toMatchObject({ runtimeContext: { prompt: current.prompt, connectionInstructions: current.connectionInstructions,
+      instructions: { bundle: { rootPath: "." } } } });
+  } else expect(template.provider).toHaveProperty("runtimeContext", null);
+  // A later attachment without a new grant keeps the latest policy, not the opening options.
+  const retained = structuredClone(template);
+  runnerdRecoveryInternals.resolvePersistentRuntime(retained, options);
+  expect(retained).toEqual(template);
+  expect(prior.prompt.text).not.toBe(current.prompt.text);
+});
+
 it("reopens Copilot with the current registered files after collecting the previous run copy", async () => {
   const root = await mkdtemp(join(tmpdir(), "copilot-current-attachment-"));
   const previousRoot = join(root, "previous-agent");
